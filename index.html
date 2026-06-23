@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GridRefCamera</title>
+<style>
+  :root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#111;background:#f4f4f4}
+  body{margin:0;padding:28px 18px 46px;max-width:820px;margin-inline:auto}
+  h1{font-size:42px;margin:10px 0 18px;letter-spacing:-1px}
+  p.lead{font-size:21px;line-height:1.35;color:#555;margin:0 0 24px}
+  .card{background:white;border-radius:24px;padding:20px;margin:0 0 20px;box-shadow:0 10px 30px rgba(0,0,0,.08)}
+  label{display:block;font-weight:800;font-size:21px;margin:0 0 8px}
+  input[type=text]{box-sizing:border-box;width:100%;font-size:18px;padding:15px 16px;border-radius:15px;border:1px solid #ccc;margin:0 0 14px}
+  button{width:100%;border:0;border-radius:20px;padding:20px 18px;font-size:24px;font-weight:850;margin:8px 0;background:#111;color:#fff}
+  button.secondary{background:#e8e8e8;color:#111}
+  button:disabled{background:#aaa;color:white}
+  .status{padding:16px;border-radius:18px;margin:14px 0;font-size:18px;line-height:1.35;background:#eef3ff;color:#1d3c78}
+  .status.good{background:#e8f7ed;color:#0b7a32}.status.warn{background:#fff3d6;color:#8a5a00}.status.bad{background:#fde8ec;color:#a5162b}
+  .kv{display:grid;grid-template-columns:120px 1fr;gap:8px 16px;font-size:19px;margin:14px 0}.kv b{font-weight:850}
+  .pill{display:inline-block;border-radius:999px;padding:4px 10px;background:#eee;font-size:15px;margin-left:8px}
+  img{max-width:100%;border-radius:18px;margin-top:12px;border:1px solid #ddd}
+  canvas{display:none}.small{font-size:15px;color:#666;line-height:1.35;margin-top:10px}
+  #photoInput{display:none}
+</style>
+</head>
+<body>
+<h1>GridRefCamera</h1>
+<p class="lead">Take a photo, capture GPS, convert it to a 10-figure British National Grid reference, and stamp it onto the image.</p>
+<div class="card">
+  <label for="note">Optional note</label>
+  <input id="note" type="text" placeholder="e.g. Pond 1, badger sett, tree T4">
+  <input id="photoInput" type="file" accept="image/*" capture="environment">
+  <button id="takeBtn">Take photo</button>
+  <button id="refreshBtn" class="secondary" disabled>Refresh GPS</button>
+  <button id="stampBtn" disabled>Stamp photo</button>
+  <button id="shareBtn" class="secondary" disabled>Save / share image</button>
+  <div id="status" class="status">Ready.</div>
+  <div class="kv" id="details" style="display:none">
+    <b>Photo ID</b><span id="photoIdOut"></span>
+    <b>Grid ref</b><span id="gridOut"></span>
+    <b>Accuracy</b><span id="accOut"></span>
+    <b>Facing</b><span id="bearingOut"></span>
+  </div>
+  <img id="preview" alt="Stamped photo preview" style="display:none">
+</div>
+<div class="card">
+  <b>GPS warning thresholds</b>
+  <p class="small">Good: ±10 m or better. Warning: ±10-25 m. Weak: worse than ±25 m. The warning is stamped on the image if accuracy is weak.</p>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+let selectedFile=null, selectedImage=null, gps=null, bearing=null, stampedBlob=null, stampedFilename='', photoCounter=Number(localStorage.getItem('grcCounter')||'0');
+const $=id=>document.getElementById(id);
+const statusEl=$('status');
+function setStatus(msg,type=''){statusEl.className='status '+type;statusEl.textContent=msg;}
+function pad(n,w=2){return String(n).padStart(w,'0')}
+function degToCompass(deg){if(deg==null||isNaN(deg))return 'unknown';const dirs=['N','NE','E','SE','S','SW','W','NW'];return dirs[Math.round(deg/45)%8]}
+function fmtTime(d=new Date()){return `${pad(d.getDate())}/${pad(d.getMonth()+1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`}
+function fileTime(d=new Date()){return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`}
+
+function wgs84ToOsgb(lat, lon){
+  const φ = lat*Math.PI/180, λ = lon*Math.PI/180;
+  const a=6378137.0, b=6356752.314245, e2=1-(b*b)/(a*a);
+  const ν=a/Math.sqrt(1-e2*Math.sin(φ)*Math.sin(φ));
+  const x1=(ν)*Math.cos(φ)*Math.cos(λ), y1=(ν)*Math.cos(φ)*Math.sin(λ), z1=(ν*(1-e2))*Math.sin(φ);
+  const tx=-446.448, ty=125.157, tz=-542.060, s=20.4894e-6;
+  const rx=(-0.1502/3600)*Math.PI/180, ry=(-0.2470/3600)*Math.PI/180, rz=(-0.8421/3600)*Math.PI/180;
+  const x2=tx+(1+s)*x1-rz*y1+ry*z1;
+  const y2=ty+rz*x1+(1+s)*y1-rx*z1;
+  const z2=tz-ry*x1+rx*y1+(1+s)*z1;
+  const a2=6377563.396, b2=6356256.909, e22=1-(b2*b2)/(a2*a2);
+  const p=Math.sqrt(x2*x2+y2*y2); let φ2=Math.atan2(z2,p*(1-e22)), φPrev;
+  do{φPrev=φ2; const ν2=a2/Math.sqrt(1-e22*Math.sin(φ2)*Math.sin(φ2)); φ2=Math.atan2(z2+e22*ν2*Math.sin(φ2),p)}while(Math.abs(φ2-φPrev)>1e-12);
+  const λ2=Math.atan2(y2,x2);
+  return latLonOsgb36ToEastingNorthing(φ2,λ2);
+}
+function latLonOsgb36ToEastingNorthing(φ,λ){
+  const a=6377563.396,b=6356256.909,F0=0.9996012717,φ0=49*Math.PI/180,λ0=-2*Math.PI/180,N0=-100000,E0=400000;
+  const e2=1-(b*b)/(a*a), n=(a-b)/(a+b);
+  const sinφ=Math.sin(φ), cosφ=Math.cos(φ), tanφ=Math.tan(φ);
+  const ν=a*F0/Math.sqrt(1-e2*sinφ*sinφ), ρ=a*F0*(1-e2)/Math.pow(1-e2*sinφ*sinφ,1.5), η2=ν/ρ-1;
+  const Ma=(1+n+(5/4)*n*n+(5/4)*n*n*n)*(φ-φ0);
+  const Mb=(3*n+3*n*n+(21/8)*n*n*n)*Math.sin(φ-φ0)*Math.cos(φ+φ0);
+  const Mc=((15/8)*n*n+(15/8)*n*n*n)*Math.sin(2*(φ-φ0))*Math.cos(2*(φ+φ0));
+  const Md=(35/24)*n*n*n*Math.sin(3*(φ-φ0))*Math.cos(3*(φ+φ0));
+  const M=b*F0*(Ma-Mb+Mc-Md);
+  const I=M+N0, II=ν/2*sinφ*cosφ, III=ν/24*sinφ*Math.pow(cosφ,3)*(5-tanφ*tanφ+9*η2), IIIA=ν/720*sinφ*Math.pow(cosφ,5)*(61-58*tanφ*tanφ+Math.pow(tanφ,4));
+  const IV=ν*cosφ, V=ν/6*Math.pow(cosφ,3)*(ν/ρ-tanφ*tanφ), VI=ν/120*Math.pow(cosφ,5)*(5-18*tanφ*tanφ+Math.pow(tanφ,4)+14*η2-58*tanφ*tanφ*η2);
+  const dλ=λ-λ0;
+  return {E:E0+IV*dλ+V*Math.pow(dλ,3)+VI*Math.pow(dλ,5), N:I+II*dλ*dλ+III*Math.pow(dλ,4)+IIIA*Math.pow(dλ,6)};
+}
+function gridLetters(E,N){
+  const e100k=Math.floor(E/100000), n100k=Math.floor(N/100000);
+  if(e100k<0||e100k>6||n100k<0||n100k>12)return '??';
+  let l1=(19-n100k)-((19-n100k)%5)+Math.floor((e100k+10)/5);
+  let l2=((19-n100k)*5%25)+(e100k%5);
+  if(l1>7)l1++; if(l2>7)l2++;
+  return String.fromCharCode(65+l1,65+l2);
+}
+function osGridRef(E,N){
+  const letters=gridLetters(E,N);
+  const e=Math.floor(E%100000), n=Math.floor(N%100000);
+  return `${letters} ${pad(e,5)} ${pad(n,5)}`;
+}
+function compactGridRef(grid){return grid.replace(/\s/g,'')}
+function accuracyLabel(a){if(a<=10)return ['Good','good']; if(a<=25)return ['Warning','warn']; return ['Weak','bad']}
+
+function getGPS(){
+  setStatus('Getting GPS fix...');
+  return new Promise((resolve,reject)=>{
+    if(!navigator.geolocation){reject(new Error('Geolocation is not available in this browser.'));return}
+    navigator.geolocation.getCurrentPosition(pos=>{
+      const c=pos.coords, en=wgs84ToOsgb(c.latitude,c.longitude), grid=osGridRef(en.E,en.N);
+      gps={lat:c.latitude, lon:c.longitude, acc:c.accuracy, grid, E:en.E, N:en.N, timestamp:new Date(pos.timestamp||Date.now())};
+      updateDetails(); resolve(gps);
+    }, err=>reject(err), {enableHighAccuracy:true, timeout:20000, maximumAge:0});
+  });
+}
+function updateDetails(){
+  if(!gps)return;
+  const [lab,cls]=accuracyLabel(gps.acc);
+  $('details').style.display='grid'; $('gridOut').textContent=gps.grid; $('accOut').innerHTML=`±${Math.round(gps.acc)} m <span class="pill">${lab}</span>`; $('bearingOut').textContent=bearing==null?'unknown':`${Math.round(bearing)}° ${degToCompass(bearing)}`; $('photoIdOut').textContent=currentPhotoId();
+  setStatus(`GPS ready: ${gps.grid}. Accuracy ±${Math.round(gps.acc)} m.`, cls==='good'?'good':cls);
+}
+function currentPhotoId(){return `IMG-${pad(photoCounter+1,4)}`}
+function nextPhotoId(){photoCounter++; localStorage.setItem('grcCounter',String(photoCounter)); return `IMG-${pad(photoCounter,4)}`}
+
+function captureBearingOnce(){
+  const handler=e=>{ if(e.webkitCompassHeading!=null) bearing=e.webkitCompassHeading; else if(e.alpha!=null) bearing=(360-e.alpha)%360; updateDetails(); };
+  if(window.DeviceOrientationEvent){
+    if(typeof DeviceOrientationEvent.requestPermission==='function'){
+      DeviceOrientationEvent.requestPermission().then(res=>{ if(res==='granted') window.addEventListener('deviceorientation',handler,{once:true}); }).catch(()=>{});
+    } else window.addEventListener('deviceorientationabsolute',handler,{once:true});
+  }
+}
+$('takeBtn').onclick=()=>{captureBearingOnce(); $('photoInput').click()};
+$('photoInput').onchange=async e=>{
+  selectedFile=e.target.files[0]; if(!selectedFile)return;
+  selectedImage=new Image(); selectedImage.onload=async()=>{setStatus('Photo loaded. Getting GPS...'); try{await getGPS(); $('stampBtn').disabled=false; $('refreshBtn').disabled=false;}catch(err){setStatus('GPS failed. '+(err.message||'Check Safari location permissions.'),'bad');}};
+  selectedImage.src=URL.createObjectURL(selectedFile);
+};
+$('refreshBtn').onclick=async()=>{stampedBlob=null; $('preview').style.display='none'; $('shareBtn').disabled=true; try{await getGPS()}catch(err){setStatus('GPS failed. '+(err.message||'Check Safari location permissions.'),'bad')}};
+$('stampBtn').onclick=()=>{ if(!selectedImage||!gps)return; stampImage(); };
+$('shareBtn').onclick=async()=>{
+  if(!stampedBlob)return;
+  const file=new File([stampedBlob],stampedFilename,{type:'image/jpeg'});
+  if(navigator.canShare&&navigator.canShare({files:[file]})){ await navigator.share({files:[file],title:stampedFilename}); }
+  else { const a=document.createElement('a'); a.href=URL.createObjectURL(stampedBlob); a.download=stampedFilename; a.click(); }
+};
+function stampImage(){
+  const c=$('canvas'), ctx=c.getContext('2d');
+  c.width=selectedImage.naturalWidth; c.height=selectedImage.naturalHeight; ctx.drawImage(selectedImage,0,0,c.width,c.height);
+  const now=new Date(), photoId=nextPhotoId(); updateDetails();
+  const [lab,cls]=accuracyLabel(gps.acc), note=$('note').value.trim();
+  const facing=bearing==null?'Facing unknown':`Facing ${Math.round(bearing)}° ${degToCompass(bearing)}`;
+  const lines=[photoId, gps.grid, `Accuracy ±${Math.round(gps.acc)} m (${lab})`, facing, fmtTime(now)]; if(note)lines.unshift(note);
+  const meta={app:'GridRefCamera',photoId,osGridRef:gps.grid,easting:Math.round(gps.E),northing:Math.round(gps.N),latitude:gps.lat,longitude:gps.lon,gpsAccuracyM:Math.round(gps.acc),compassBearingDeg:bearing==null?null:Math.round(bearing),timestamp:now.toISOString(),note};
+  const fontSize=Math.max(34,Math.round(c.width/38)); ctx.font=`700 ${fontSize}px Arial`; const padBox=Math.round(fontSize*.7), lineH=Math.round(fontSize*1.25);
+  const maxW=Math.max(...lines.map(t=>ctx.measureText(t).width)); const boxW=Math.min(c.width-padBox*2, maxW+padBox*2); const boxH=lines.length*lineH+padBox*2;
+  const x=padBox, y=c.height-boxH-padBox;
+  ctx.fillStyle='rgba(0,0,0,.68)'; ctx.fillRect(x,y,boxW,boxH); ctx.fillStyle='white'; ctx.textBaseline='top';
+  lines.forEach((t,i)=>ctx.fillText(t,x+padBox,y+padBox+i*lineH));
+  if(cls==='bad'){ctx.fillStyle='rgba(170,0,0,.82)'; ctx.fillRect(x,y-boxH*.42,boxW,Math.round(lineH*1.4)); ctx.fillStyle='white'; ctx.fillText('WEAK GPS',x+padBox,y-boxH*.42+Math.round(lineH*.18));}
+  stampedFilename=`${photoId}_${fileTime(now)}_${compactGridRef(gps.grid)}.jpg`;
+  c.toBlob(blob=>{ addJpegComment(blob, JSON.stringify(meta)).then(b=>{stampedBlob=b; $('preview').src=URL.createObjectURL(b); $('preview').style.display='block'; $('shareBtn').disabled=false; setStatus('Stamped photo ready. Tap Save / share image, then choose Save Image.','good'); }); },'image/jpeg',0.92);
+}
+async function addJpegComment(blob, comment){
+  const arr=new Uint8Array(await blob.arrayBuffer()); const enc=new TextEncoder().encode('GridRefCamera metadata: '+comment); const len=enc.length+2; const seg=new Uint8Array(4+enc.length); seg[0]=0xFF; seg[1]=0xFE; seg[2]=(len>>8)&255; seg[3]=len&255; seg.set(enc,4);
+  const out=new Uint8Array(arr.length+seg.length); out.set(arr.slice(0,2),0); out.set(seg,2); out.set(arr.slice(2),2+seg.length); return new Blob([out],{type:'image/jpeg'});
+}
+</script>
+</body>
+</html>
